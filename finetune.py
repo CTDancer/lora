@@ -5,7 +5,10 @@ from typing import List
 import fire
 import torch
 import transformers
-from datasets import load_dataset
+from datasets import load_dataset, load_metric
+import torch.nn as nn
+import evaluate
+import numpy as np
 
 """
 Unused imports:
@@ -23,7 +26,7 @@ from peft import (
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from utils.prompter import Prompter
-
+from utils.save_callback import SavePeftModelCallback
 
 def train(
     # model/data params
@@ -56,6 +59,8 @@ def train(
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    save_interval: int = 1,
+    save_dir: str = "",
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -82,6 +87,8 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
+            f"save_interval: {save_interval}\n"
+            f"save_dir: {save_dir}\n"
         )
     assert (
         base_model
@@ -229,10 +236,24 @@ def train(
         model.is_parallelizable = True
         model.model_parallel = True
 
+    metric = load_metric('sacrebleu')
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        predictions = predictions.tolist()
+        preds = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in predictions]
+        print("preds: ", preds)
+        labels = labels.tolist()
+        labs = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in labels]
+        print("labs: ", labs)
+        return metric.compute(predictions=preds, references=labs)
+
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
+        compute_metrics=compute_metrics,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
@@ -244,7 +265,7 @@ def train(
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
-            eval_steps=200 if val_set_size > 0 else None,
+            eval_steps=1 if val_set_size > 0 else None,
             save_steps=200,
             output_dir=output_dir,
             save_total_limit=3,
@@ -257,6 +278,7 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
+        callbacks=[SavePeftModelCallback],
     )
     model.config.use_cache = False
 
@@ -267,12 +289,39 @@ def train(
         )
     ).__get__(model, type(model))
 
+    # teacher_state_dict = torch.load('/shared/dqwang/scratch/tongchen/lora-try/replay_buffer_1.pt')
+    # for name, param in model.state_dict().items():
+    #     if name in teacher_state_dict[0]:
+    #         new_param = nn.Parameter(teacher_state_dict[0][name].data)
+    #         model.state_dict()[name].copy_(new_param.data)
+
+
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
+    timestamps = []
+
+    print("train start")
+
+    _, timestamps = trainer.train(resume_from_checkpoint=resume_from_checkpoint, timestamps=timestamps)
+
+    # trajectories.append(timestamps)
+    # if len(trajectories) == save_interval:
+    #         n = 0
+    #         while os.path.exists(os.path.join(save_dir, "replay_buffer_{}.pt".format(n))):
+    #             n += 1
+    #         print("Saving {}".format(os.path.join(save_dir, "replay_buffer_{}.pt".format(n))))
+    #         torch.save(trajectories, os.path.join(save_dir, "replay_buffer_{}.pt".format(n)))
+    #         trajectories = []
+
+    torch.save(timestamps, os.path.join(save_dir, "replay_buffer_0.pt"))
 
     model.save_pretrained(output_dir)
+
+    trainer.evaluate()
 
     print(
         "\n If there's a warning about missing keys above, please disregard :)"
