@@ -236,17 +236,21 @@ def train(
         model.is_parallelizable = True
         model.model_parallel = True
 
-    metric = load_metric('sacrebleu')
+    metric = load_metric('bleu')
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         predictions = np.argmax(logits, axis=-1)
         predictions = predictions.tolist()
+        for i in range(len(predictions)):
+            predictions[i] = [x for x in predictions[i] if (x != 0 and x != 30965)]
         preds = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in predictions]
-        print("preds: ", preds)
+        preds = [sentence.split() for sentence in preds]
         labels = labels.tolist()
+        for i in range(len(labels)):
+            labels[i] = [x for x in labels[i] if x != -100]
         labs = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in labels]
-        print("labs: ", labs)
+        labs = [[sentence.split()] for sentence in labs]
         return metric.compute(predictions=preds, references=labs)
 
     trainer = transformers.Trainer(
@@ -265,7 +269,7 @@ def train(
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
-            eval_steps=1 if val_set_size > 0 else None,
+            eval_steps=200 if val_set_size > 0 else None,
             save_steps=200,
             output_dir=output_dir,
             save_total_limit=3,
@@ -289,12 +293,6 @@ def train(
         )
     ).__get__(model, type(model))
 
-    # teacher_state_dict = torch.load('/shared/dqwang/scratch/tongchen/lora-try/replay_buffer_1.pt')
-    # for name, param in model.state_dict().items():
-    #     if name in teacher_state_dict[0]:
-    #         new_param = nn.Parameter(teacher_state_dict[0][name].data)
-    #         model.state_dict()[name].copy_(new_param.data)
-
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
@@ -303,8 +301,6 @@ def train(
         os.mkdir(save_dir)
 
     timestamps = []
-
-    print("train start")
 
     _, timestamps = trainer.train(resume_from_checkpoint=resume_from_checkpoint, timestamps=timestamps)
 

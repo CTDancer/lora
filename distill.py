@@ -9,6 +9,7 @@ from datasets import load_dataset, load_metric
 import numpy as np
 import torch.nn as nn
 import evaluate
+from torch.utils.data import Dataset, TensorDataset
 
 from peft import (
     LoraConfig,
@@ -23,12 +24,23 @@ from utils.prompter import Prompter
 from utils.get_model import get_model
 from utils.save_callback import SavePeftModelCallback
 
+# define the dataset used for creating dataset from `inputs`
+class CustomDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return self.data[index]
+
 
 def main(
     # model/data params
     base_model: str = "",  # the only required argument
     data_path: str = "./distilled_dataset",
-    val_path: str = "./alpaca-cleaned",
+    val_path: str = "./alpaca_data_cleaned_archive",
     output_dir: str = "./lora-alpaca",
     # training hyperparams
     batch_size: int = 128,
@@ -69,12 +81,7 @@ def main(
     eval_it: int = 200,
     epoch_eval_train: int = 500
 ): 
-
-    model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
-                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
-
-    prompter = Prompter(prompt_template_name)
-
+    # metadata
     # Check if parameter passed or if set within environ
     use_wandb = len(wandb_project) > 0 or (
         "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
@@ -87,8 +94,19 @@ def main(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+
+    # get the model for training
+    model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
+                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
+    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+
+
+    # define tokenizer
+    prompter = Prompter(prompt_template_name)
+
+    tokenizer = LlamaTokenizer.from_pretrained(base_model)
     tokenizer.pad_token_id = (
         0  # unk. we want this to be different from the eos token
     )
@@ -143,6 +161,7 @@ def main(
         return tokenized_full_prompt
 
 
+    # get data
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         distilled_data = load_dataset("json", data_files=data_path)
     else:
@@ -156,28 +175,89 @@ def main(
     train_data = distilled_data["train"].shuffle().map(generate_and_tokenize_prompt)
     val_data = val_data["train"].shuffle().map(generate_and_tokenize_prompt)
 
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-    metric = load_metric('sacrebleu')
+    # define the evaluation metrics
+    metric = load_metric('bleu')
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         predictions = np.argmax(logits, axis=-1)
         predictions = predictions.tolist()
+        for i in range(len(predictions)):
+            predictions[i] = [x for x in predictions[i] if (x != 0 and x != 30965)]
         preds = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in predictions]
-        # print("preds: ", preds)
+        preds = [sentence.split() for sentence in preds]
         labels = labels.tolist()
+        for i in range(len(labels)):
+            labels[i] = [x for x in labels[i] if x != -100]
         labs = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in labels]
-        # print("labs: ", labs)
+        labs = [[sentence.split()] for sentence in labs]
         return metric.compute(predictions=preds, references=labs)
 
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # get the trainer for synthetic step
+    syn_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=train_data,
+            eval_dataset=None,
+            compute_metrics=compute_metrics,
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=syn_steps,
+                learning_rate=syn_lr,
+                fp16=True,
+                logging_steps=1,
+                optim="adamw_torch",
+                evaluation_strategy="no",
+                save_strategy="steps",
+                eval_steps=None,
+                save_steps=200,
+                output_dir=output_dir,
+                save_total_limit=3,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name=wandb_run_name if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+            callbacks=[SavePeftModelCallback],
+        )
 
+    model.config.use_cache = False
+
+    old_state_dict = model.state_dict
+    model.state_dict = (
+        lambda self, *_, **__: get_peft_model_state_dict(
+            self, old_state_dict()
+        )
+    ).__get__(model, type(model))
+
+    for name, param in model.state_dict().items():
+        if name in student_params[-1]:
+            new_param = nn.Parameter(student_params[-1][name].data)
+            model.state_dict()[name].copy_(new_param.data)
+
+    if torch.__version__ >= "2" and sys.platform != "win32":
+        model = torch.compile(model)
+
+
+    # get the inputs for trainer
+    inputs = []
+    dataloader = syn_trainer.get_train_dataloader()
+    for batch in dataloader:
+        input = syn_trainer._prepare_inputs(batch)
+        inputs.append(input)
+
+    # define the optimizers
     syn_lr = torch.tensor(lr_teacher).to(device)
     syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-    optimizer_text = torch.optim.SGD([train_data], lr=lr_text, momentum=0.5)
+    optimizer_text = torch.optim.SGD([inputs], lr=lr_text, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=lr_lr, momentum=0.5)
     optimizer_text.zero_grad()
 
@@ -235,13 +315,31 @@ def main(
                 random.shuffle(buffer)
         
         if it in eval_it_pool:
-            model, gradient_accumulation_steps, _ = get_model(base_model='decapoda-research/llama-7b-hf')
-
             lr = syn_lr.item()
 
-            trainer = transformers.Trainer(
-                model=model,
-                train_dataset=train_data,
+            # get model for evaluation
+            eval_model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
+                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
+
+
+            # get data for evaluation by converting `inputs` to a dataset
+            # the only difference between `batch` and `input` is the device
+            batches = []
+            for input in inputs:
+                batch = {k:v.cpu() for k, v in input}
+                batches.append(batch)
+            
+            dataset = CustomDataset(batches)
+            metadata = {
+                'features': ['input_ids', 'attention_mask', 'labels'],
+                'num_rows': len(dataset)
+            }
+            eval_dataset = {'Dataset': dataset, 'metadata': metadata}
+
+
+            eval_trainer = transformers.Trainer(
+                model=eval_model,
+                train_dataset=eval_dataset,
                 eval_dataset=val_data,
                 compute_metrics=compute_metrics,
                 args=transformers.TrainingArguments(
@@ -270,20 +368,20 @@ def main(
                 ),
                 callbacks=[SavePeftModelCallback],
             )
-            model.config.use_cache = False
+            eval_model.config.use_cache = False
 
-            old_state_dict = model.state_dict
-            model.state_dict = (
+            old_state_dict = eval_model.state_dict
+            eval_model.state_dict = (
                 lambda self, *_, **__: get_peft_model_state_dict(
                     self, old_state_dict()
                 )
-            ).__get__(model, type(model))
+            ).__get__(eval_model, type(eval_model))
 
             if torch.__version__ >= "2" and sys.platform != "win32":
-                model = torch.compile(model)
+                eval_model = torch.compile(eval_model)
 
-            trainer.train()
-            metric = trainer.evaluate()
+            eval_trainer.train()
+            metric = eval_trainer.evaluate()
 
             print("metric: ", metric)
 
@@ -305,6 +403,8 @@ def main(
                     torch.save(text_save.cpu(), os.path.join(save_dir, "text_best.json"))
                     torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
 
+
+        # define expert and student parameters
         start_epoch = np.random.randint(0, max_start_epoch)
         starting_params = expert_trajectory[start_epoch]
 
@@ -315,72 +415,32 @@ def main(
 
         starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params], 0)
 
-        trainer = transformers.Trainer(
-            model=model,
-            train_dataset=train_data,
-            eval_dataset=None,
-            args=transformers.TrainingArguments(
-                per_device_train_batch_size=micro_batch_size,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                warmup_steps=0,
-                num_train_epochs=syn_steps,
-                learning_rate=syn_lr,
-                fp16=True,
-                logging_steps=1,
-                optim="adamw_torch",
-                evaluation_strategy="no",
-                save_strategy="steps",
-                eval_steps=None,
-                save_steps=200,
-                output_dir=output_dir,
-                save_total_limit=3,
-                load_best_model_at_end=True if val_set_size > 0 else False,
-                ddp_find_unused_parameters=False if ddp else None,
-                group_by_length=group_by_length,
-                report_to="wandb" if use_wandb else None,
-                run_name=wandb_run_name if use_wandb else None,
-            ),
-            data_collator=transformers.DataCollatorForSeq2Seq(
-                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-            ),
-            callbacks=[SavePeftModelCallback],
-        )
 
-        model.config.use_cache = False
-
-        old_state_dict = model.state_dict
-        model.state_dict = (
-            lambda self, *_, **__: get_peft_model_state_dict(
-                self, old_state_dict()
-            )
-        ).__get__(model, type(model))
-
+        # initialize model's weights with expert parameters
+        model_state_dict = model.state_dict()
+        teacher_state_dict = torch.load('/shared/dqwang/scratch/tongchen/lora-try/replay_buffer_1.pt')
         for name, param in model.state_dict().items():
-            if name in student_params[-1]:
-                new_param = nn.Parameter(student_params[-1][name].data)
-                model.state_dict()[name].copy_(new_param.data)
-
-        if torch.__version__ >= "2" and sys.platform != "win32":
-            model = torch.compile(model)
-
-        dataloader = trainer.get_train_dataloader()
-        batch = next(iter(dataloader))
-        inputs = trainer._prepare_inputs(batch)
+            if name in teacher_state_dict[0]:
+                new_param = nn.Parameter(expert_trajectory[start_epoch][name].data)
+                model_state_dict[name].copy_(new_param.data)
+        model.load_state_dict(model_state_dict)
         
+
+        # use distilled dataset to train the model for syn_steps steps and get parameters along the way
         timestamps = []
-
-        _, timestamps = trainer.train(inputs=inputs, timestamps=timestamps)
-
-        param_loss = torch.tensor(0.0).to(device)
-        param_dist = torch.tensor(0.0).to(device)
+        timestamps = syn_trainer.syn_train(inputs=inputs, timestamps=timestamps)
 
         for param_dict in timestamps:
             param = torch.cat([v.data.to(device).reshape(-1) for k, v in param_dict], 0).requires_grad_(True)
             student_params.append(param)
 
+
+        # compute parameter distance loss and update distilled dataset
+        param_loss = torch.tensor(0.0).to(device)
+        param_dist = torch.tensor(0.0).to(device)
+
         param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
-
         param_loss /= param_dist
 
         grand_loss = param_loss
