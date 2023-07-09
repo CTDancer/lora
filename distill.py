@@ -64,16 +64,15 @@ def main(
     wandb_run_name: str = "",
     wandb_watch: str = "",  # options: false | gradients | all
     wandb_log_model: str = "",  # options: false | true
-    resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
     # distillation hyperparameters
     Iteration: int = 2000,
-    load_all: bool = False,
+    load_all: bool = True,
     max_files: int = None,
     max_experts: int = None,
     expert_dir: str = "",
     max_start_epoch: int = 1,
-    expert_epochs: int = 2,
+    expert_epochs: int = 1,
     syn_steps: int = 5,
     lr_teacher: float = 1e-3,
     lr_text: float = 1e2,
@@ -175,6 +174,9 @@ def main(
     train_data = distilled_data["train"].shuffle().map(generate_and_tokenize_prompt)
     val_data = val_data["train"].shuffle().map(generate_and_tokenize_prompt)
 
+    if val_set_size != len(val_data):
+        val_data = val_data[:val_set_size]
+
 
     # define the evaluation metrics
     metric = load_metric('bleu')
@@ -195,6 +197,9 @@ def main(
         return metric.compute(predictions=preds, references=labs)
 
 
+    syn_lr = torch.tensor(lr_teacher).to(device)
+    syn_lr = syn_lr.detach().to(device).requires_grad_(True)
+
     # get the trainer for synthetic step
     syn_trainer = transformers.Trainer(
             model=model,
@@ -211,12 +216,8 @@ def main(
                 logging_steps=1,
                 optim="adamw_torch",
                 evaluation_strategy="no",
-                save_strategy="steps",
                 eval_steps=None,
-                save_steps=200,
                 output_dir=output_dir,
-                save_total_limit=3,
-                load_best_model_at_end=True if val_set_size > 0 else False,
                 ddp_find_unused_parameters=False if ddp else None,
                 group_by_length=group_by_length,
                 report_to="wandb" if use_wandb else None,
@@ -237,27 +238,27 @@ def main(
         )
     ).__get__(model, type(model))
 
-    for name, param in model.state_dict().items():
-        if name in student_params[-1]:
-            new_param = nn.Parameter(student_params[-1][name].data)
-            model.state_dict()[name].copy_(new_param.data)
-
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
 
     # get the inputs for trainer
-    inputs = []
+    syn_text = []
     dataloader = syn_trainer.get_train_dataloader()
+    keys = []
     for batch in dataloader:
         input = syn_trainer._prepare_inputs(batch)
-        inputs.append(input)
+        text = [v.float() for k,v in input.items()]
+        text = torch.stack(text, dim=2).requires_grad_(True)
+        # for k, v in input.items():
+        #     print("{}.shape: {}".format(k, v.shape))
+        # print("shape: ", text.shape)
+        syn_text.append(text)
+        if not keys:
+            keys = [k for k in input]
 
     # define the optimizers
-    syn_lr = torch.tensor(lr_teacher).to(device)
-    syn_lr = syn_lr.detach().to(device).requires_grad_(True)
-
-    optimizer_text = torch.optim.SGD([inputs], lr=lr_text, momentum=0.5)
+    optimizer_text = torch.optim.SGD(syn_text, lr=lr_text, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=lr_lr, momentum=0.5)
     optimizer_text.zero_grad()
 
@@ -267,7 +268,7 @@ def main(
         buffer = []
         n = 0
         while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
-            buffer = buffer + torch.load(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
+            buffer = buffer + torch.load(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)), map_location='cuda:0')
             n += 1
         if n == 0:
             raise AssertionError("No buffers detected at {}".format(expert_dir))
@@ -285,7 +286,7 @@ def main(
         if max_files is not None:
             expert_files = expert_files[:max_files]
         print("loading file {}".format(expert_files[file_idx]))
-        buffer = torch.load(expert_files[file_idx])
+        buffer = torch.load(expert_files[file_idx], map_location='cuda:0')
         if max_experts is not None:
             buffer = buffer[:max_experts]
         random.shuffle(buffer)
@@ -295,38 +296,33 @@ def main(
     for it in range(0, Iteration+1):
         save_this_it = False
 
-        if load_all:
-            expert_trajectory = buffer[np.random.randint(0, len(buffer))]
-        else:
-            expert_trajectory = buffer[expert_idx]
-            expert_idx += 1
-            if expert_idx == len(buffer):
-                expert_idx = 0
-                file_idx += 1
-                if file_idx == len(expert_files):
-                    file_idx = 0
-                    random.shuffle(expert_files)
-                print("loading file {}".format(expert_files[file_idx]))
-                if max_files != 1:
-                    del buffer
-                    buffer = torch.load(expert_files[file_idx])
-                if max_experts is not None:
-                    buffer = buffer[:max_experts]
-                random.shuffle(buffer)
+        expert_trajectory = buffer
+        # if load_all:
+        #     expert_trajectory = buffer[np.random.randint(0, len(buffer))]
+        # else:
+        #     expert_trajectory = buffer[expert_idx]
+        #     expert_idx += 1
+        #     if expert_idx == len(buffer):
+        #         expert_idx = 0
+        #         file_idx += 1
+        #         if file_idx == len(expert_files):
+        #             file_idx = 0
+        #             random.shuffle(expert_files)
+        #         print("loading file {}".format(expert_files[file_idx]))
+        #         if max_files != 1:
+        #             del buffer
+        #             buffer = torch.load(expert_files[file_idx], map_location='cuda:0')
+        #         if max_experts is not None:
+        #             buffer = buffer[:max_experts]
+        #         random.shuffle(buffer)
         
-        if it in eval_it_pool:
-            lr = syn_lr.item()
-
-            # get model for evaluation
-            eval_model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
-                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
-
-
-            # get data for evaluation by converting `inputs` to a dataset
-            # the only difference between `batch` and `input` is the device
+        # get dataset for evaluation or saving
+        if (it in eval_it_pool) or save_this_it or (it % 1000 == 0):
             batches = []
-            for input in inputs:
-                batch = {k:v.cpu() for k, v in input}
+            for i in range(len(syn_text)):
+                batch = {}
+                for j in range(len(keys)):
+                    batch.update({keys[j]: torch.round(syn_text[i][:,:,j]).detach().long()})
                 batches.append(batch)
             
             dataset = CustomDataset(batches)
@@ -336,6 +332,12 @@ def main(
             }
             eval_dataset = {'Dataset': dataset, 'metadata': metadata}
 
+        if it in eval_it_pool:
+            lr = syn_lr.item()
+
+            # get model for evaluation
+            eval_model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
+                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
 
             eval_trainer = transformers.Trainer(
                 model=eval_model,
@@ -385,22 +387,22 @@ def main(
 
             print("metric: ", metric)
 
-            if (metric > best_metric):
+            if (metric['eval_bleu'] > best_metric):
                 best_metric = metric
                 save_this_it = True
 
         if (save_this_it or it % 1000 == 0):
             with torch.no_grad():
-                text_save = train_data.cuda()
+                text_save = eval_dataset
                 save_dir = os.path.join(".", "logged_files")
 
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
 
-                torch.save(text_save.cpu(), os.path.join(save_dir, "text_{}.json".format(it)))
+                torch.save(text_save, os.path.join(save_dir, "text_{}.json".format(it)))
 
                 if save_this_it:
-                    torch.save(text_save.cpu(), os.path.join(save_dir, "text_best.json"))
+                    torch.save(text_save, os.path.join(save_dir, "text_best.json"))
                     torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
 
 
@@ -408,31 +410,29 @@ def main(
         start_epoch = np.random.randint(0, max_start_epoch)
         starting_params = expert_trajectory[start_epoch]
 
+        starting_dict = starting_params
+
         target_params = expert_trajectory[start_epoch+expert_epochs]
-        target_params = torch.cat([v.data.to(device).reshape(-1) for k, v in target_params], 0)
+        target_params = torch.cat([v.data.to(device).reshape(-1) for k, v in target_params.items() if 'lora_' in k or 'bias' in k], 0)
 
-        student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params], 0).requires_grad_(True)]
+        student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)]
 
-        starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params], 0)
+        starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0)
 
 
         # initialize model's weights with expert parameters
-        model_state_dict = model.state_dict()
-        teacher_state_dict = torch.load('/shared/dqwang/scratch/tongchen/lora-try/replay_buffer_1.pt')
-        for name, param in model.state_dict().items():
-            if name in teacher_state_dict[0]:
-                new_param = nn.Parameter(expert_trajectory[start_epoch][name].data)
-                model_state_dict[name].copy_(new_param.data)
-        model.load_state_dict(model_state_dict)
-        
+        for name, param in model.named_parameters():
+            if name in starting_dict and ('lora_' in name or 'bias' in name):
+                param.data = starting_dict[name]
+
 
         # use distilled dataset to train the model for syn_steps steps and get parameters along the way
         timestamps = []
-        timestamps = syn_trainer.syn_train(inputs=inputs, timestamps=timestamps)
+        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys, timestamps=timestamps)
 
-        for param_dict in timestamps:
-            param = torch.cat([v.data.to(device).reshape(-1) for k, v in param_dict], 0).requires_grad_(True)
-            student_params.append(param)
+        # for param_dict in timestamps:
+        param = torch.cat([v.data.to(device).reshape(-1) for k, v in timestamps[-1].items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)
+        student_params.append(param)
 
 
         # compute parameter distance loss and update distilled dataset
@@ -441,6 +441,7 @@ def main(
 
         param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
+        print("iter = %04d, param_loss = %.4f, param_dist = %.4f" % (it, param_loss, param_dist))
         param_loss /= param_dist
 
         grand_loss = param_loss
@@ -458,3 +459,6 @@ def main(
         
         if it%10 == 0:
             print('iter = %04d, loss = %.4f' % (it, grand_loss.item()))
+
+if __name__ == "__main__":
+    fire.Fire(main)
