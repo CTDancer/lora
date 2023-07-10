@@ -297,24 +297,24 @@ def main(
         save_this_it = False
 
         expert_trajectory = buffer
-        # if load_all:
-        #     expert_trajectory = buffer[np.random.randint(0, len(buffer))]
-        # else:
-        #     expert_trajectory = buffer[expert_idx]
-        #     expert_idx += 1
-        #     if expert_idx == len(buffer):
-        #         expert_idx = 0
-        #         file_idx += 1
-        #         if file_idx == len(expert_files):
-        #             file_idx = 0
-        #             random.shuffle(expert_files)
-        #         print("loading file {}".format(expert_files[file_idx]))
-        #         if max_files != 1:
-        #             del buffer
-        #             buffer = torch.load(expert_files[file_idx], map_location='cuda:0')
-        #         if max_experts is not None:
-        #             buffer = buffer[:max_experts]
-        #         random.shuffle(buffer)
+        if load_all:
+            expert_trajectory = buffer[np.random.randint(0, len(buffer))]
+        else:
+            expert_trajectory = buffer[expert_idx]
+            expert_idx += 1
+            if expert_idx == len(buffer):
+                expert_idx = 0
+                file_idx += 1
+                if file_idx == len(expert_files):
+                    file_idx = 0
+                    random.shuffle(expert_files)
+                print("loading file {}".format(expert_files[file_idx]))
+                if max_files != 1:
+                    del buffer
+                    buffer = torch.load(expert_files[file_idx], map_location='cuda:0')
+                if max_experts is not None:
+                    buffer = buffer[:max_experts]
+                random.shuffle(buffer)
         
         # get dataset for evaluation or saving
         if (it in eval_it_pool) or save_this_it or (it % 1000 == 0):
