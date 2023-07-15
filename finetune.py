@@ -1,7 +1,7 @@
 import os
 import sys
 from typing import List
-
+import logging
 import fire
 import torch
 import transformers
@@ -64,6 +64,16 @@ def train(
     save_dir: str = "",
     num_experts: int = 1,
 ):
+    # Configure the root logger
+    logging.basicConfig(
+        level=logging.INFO,  # Set the desired log level
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/{}.log'.format(wandb_run_name)),  # Save logs to a file
+            logging.StreamHandler()  # Print logs to the console
+        ]
+    )
+
     if not os.path.exists(save_dir):
             os.mkdir(save_dir)
     
@@ -84,7 +94,7 @@ def train(
             os.environ["WANDB_WATCH"] = wandb_watch
         if len(wandb_log_model) > 0:
             os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-        wandb_run_name += "-{}".format(it)
+        wandb_run_name += "_it={}".format(it)
 
 
         # define tokenizer
@@ -189,23 +199,37 @@ def train(
 
 
         # define evaluation metric
-        metric = load_metric('bleu')
+        # metric = load_metric('bleu')
+        
+        # def compute_metrics(eval_pred):
+        #     logits, labels = eval_pred
+        #     predictions = np.argmax(logits, axis=-1)
+        #     predictions = predictions.tolist()
+        #     for i in range(len(predictions)):
+        #         predictions[i] = [x for x in predictions[i] if (x != 0 and x != 30965)]
+        #     preds = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in predictions]
+        #     preds = [sentence.split() for sentence in preds]
+        #     labels = labels.tolist()
+        #     for i in range(len(labels)):
+        #         labels[i] = [x for x in labels[i] if x != -100]
+        #     labs = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in labels]
+        #     labs = [[sentence.split()] for sentence in labs]
+        #     return metric.compute(predictions=preds, references=labs)
 
+        metric = load_metric('accuracy')
+        
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
             predictions = np.argmax(logits, axis=-1)
             predictions = predictions.tolist()
-            for i in range(len(predictions)):
-                predictions[i] = [x for x in predictions[i] if (x != 0 and x != 30965)]
-            preds = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in predictions]
-            preds = [sentence.split() for sentence in preds]
+            # remove values 0 and 30965 from each batch of predictions
+            predictions = [[x for x in batch] for batch in predictions]
             labels = labels.tolist()
-            for i in range(len(labels)):
-                labels[i] = [x for x in labels[i] if x != -100]
-            labs = [tokenizer.convert_tokens_to_string(encoded_text) for encoded_text in labels]
-            labs = [[sentence.split()] for sentence in labs]
-            return metric.compute(predictions=preds, references=labs)
-
+            # remove values -100 from each batch of labels
+            labels = [[x for x in batch] for batch in labels]
+            # compute accuracy for each batch and average the results
+            accuracies = [metric.compute(predictions=p, references=r)['accuracy'] for p, r in zip(predictions, labels)]
+            return {'accuracy': np.mean(accuracies)}
 
         # define trainer
         trainer = transformers.Trainer(
@@ -241,20 +265,27 @@ def train(
         )
         model.config.use_cache = False
 
+        timestamps = []
+
         old_state_dict = model.state_dict
-        model.state_dict = (
-            lambda self, *_, **__: get_peft_model_state_dict(
-                self, old_state_dict()
-            )
-        ).__get__(model, type(model))
+
+        timestamps.append({name: param for name, param in model.named_parameters()})  
+
+        # model.state_dict = (
+        #     lambda self, *_, **__: get_peft_model_state_dict(
+        #         self, old_state_dict()
+        #     )
+        # ).__get__(model, type(model))
 
         if torch.__version__ >= "2" and sys.platform != "win32":
             model = torch.compile(model)
 
-        timestamps = []
+
         trajectories = []
 
         _, timestamps = trainer.train(resume_from_checkpoint=resume_from_checkpoint, timestamps=timestamps)
+
+        print("timestamps length: ", len(timestamps))
 
         trajectories.append(timestamps)
         if len(trajectories) == save_interval:

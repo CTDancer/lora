@@ -10,6 +10,8 @@ import numpy as np
 import torch.nn as nn
 import evaluate
 from torch.utils.data import Dataset, TensorDataset
+import logging
+import wandb
 
 from peft import (
     LoraConfig,
@@ -46,7 +48,7 @@ def main(
     batch_size: int = 128,
     micro_batch_size: int = 4,
     cutoff_len: int = 256,
-    val_set_size: int = 2000,
+    val_set_size: int = 200,
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
@@ -59,11 +61,6 @@ def main(
     train_on_inputs: bool = True,  # if False, masks out inputs in loss
     add_eos_token: bool = False,
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
-    # wandb params
-    wandb_project: str = "",
-    wandb_run_name: str = "",
-    wandb_watch: str = "",  # options: false | gradients | all
-    wandb_log_model: str = "",  # options: false | true
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
     # distillation hyperparameters
     Iteration: int = 2000,
@@ -78,20 +75,24 @@ def main(
     lr_text: float = 1e2,
     lr_lr: float = 1e-5,
     eval_it: int = 200,
-    epoch_eval_train: int = 500
+    epoch_eval_train: int = 20
 ): 
-    # metadata
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
+    # Configure the root logger
+    logging.basicConfig(
+        level=logging.INFO,  # Set the desired log level
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/distill.log'),  # Save logs to a file
+            logging.StreamHandler()  # Print logs to the console
+        ]
     )
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
+    wandb.init(sync_tensorboard=False,
+                entity='tongchen',
+                project="alpaca-lora-distill",
+                name="size=100-lr_teacher={}-lr_text={}-lr_lr={}-syn_steps={}".format(lr_teacher, lr_text, lr_lr, syn_steps)
+            #    name='test'
+               )
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -174,7 +175,7 @@ def main(
     train_data = distilled_data["train"].shuffle().map(generate_and_tokenize_prompt)
     val_data = val_data["train"].shuffle().map(generate_and_tokenize_prompt)
 
-    if val_set_size != len(val_data):
+    if val_set_size < len(val_data):
         val_data = val_data[:val_set_size]
 
 
@@ -215,13 +216,9 @@ def main(
                 fp16=True,
                 logging_steps=1,
                 optim="adamw_torch",
-                evaluation_strategy="no",
-                eval_steps=None,
                 output_dir=output_dir,
                 ddp_find_unused_parameters=False if ddp else None,
                 group_by_length=group_by_length,
-                report_to="wandb" if use_wandb else None,
-                run_name=wandb_run_name if use_wandb else None,
             ),
             data_collator=transformers.DataCollatorForSeq2Seq(
                 tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
@@ -230,6 +227,8 @@ def main(
         )
 
     model.config.use_cache = False
+
+    starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in model.named_parameters() if 'lora_' in k or 'bias' in k], 0)
 
     old_state_dict = model.state_dict
     model.state_dict = (
@@ -250,9 +249,6 @@ def main(
         input = syn_trainer._prepare_inputs(batch)
         text = [v.float() for k,v in input.items()]
         text = torch.stack(text, dim=2).requires_grad_(True)
-        # for k, v in input.items():
-        #     print("{}.shape: {}".format(k, v.shape))
-        # print("shape: ", text.shape)
         syn_text.append(text)
         if not keys:
             keys = [k for k in input]
@@ -260,7 +256,6 @@ def main(
     # define the optimizers
     optimizer_text = torch.optim.SGD(syn_text, lr=lr_text, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=lr_lr, momentum=0.5)
-    optimizer_text.zero_grad()
 
     eval_it_pool = np.arange(0, Iteration + 1, eval_it).tolist()[1:]
 
@@ -294,6 +289,7 @@ def main(
     best_metric = 0
 
     for it in range(0, Iteration+1):
+        wandb.log({"Progress": it}, step=it)
         save_this_it = False
 
         expert_trajectory = buffer
@@ -362,8 +358,6 @@ def main(
                     load_best_model_at_end=True if val_set_size > 0 else False,
                     ddp_find_unused_parameters=False if ddp else None,
                     group_by_length=group_by_length,
-                    report_to="wandb" if use_wandb else None,
-                    run_name=wandb_run_name if use_wandb else None,
                 ),
                 data_collator=transformers.DataCollatorForSeq2Seq(
                     tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
@@ -390,6 +384,8 @@ def main(
             if (metric['eval_bleu'] > best_metric):
                 best_metric = metric
                 save_this_it = True
+            
+            wandb.log({'BLEU': metric['eval_bleu']}, step=it)
 
         if (save_this_it or it % 1000 == 0):
             with torch.no_grad():
@@ -406,40 +402,38 @@ def main(
                     torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
 
 
+        wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
         # define expert and student parameters
-        start_epoch = np.random.randint(0, max_start_epoch)
-        starting_params = expert_trajectory[start_epoch]
+        # start_epoch = np.random.randint(0, max_start_epoch)
+        # starting_params = expert_trajectory[start_epoch]
 
-        starting_dict = starting_params
+        # starting_dict = starting_params
 
-        target_params = expert_trajectory[start_epoch+expert_epochs]
+        target_params = expert_trajectory[-1]
         target_params = torch.cat([v.data.to(device).reshape(-1) for k, v in target_params.items() if 'lora_' in k or 'bias' in k], 0)
 
-        student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)]
-
-        starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0)
-
+        # student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)]
 
         # initialize model's weights with expert parameters
-        for name, param in model.named_parameters():
-            if name in starting_dict and ('lora_' in name or 'bias' in name):
-                param.data = starting_dict[name]
+        # for name, param in model.named_parameters():
+        #     if name in starting_dict and ('lora_' in name or 'bias' in name):
+        #         param.data = starting_dict[name]
 
+        print(f"Is syn_text[{0}] a leaf node?:", syn_text[0].is_leaf)
 
         # use distilled dataset to train the model for syn_steps steps and get parameters along the way
-        timestamps = []
-        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys, timestamps=timestamps)
+        timestamps = None
+        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys)
 
         # for param_dict in timestamps:
-        param = torch.cat([v.data.to(device).reshape(-1) for k, v in timestamps[-1].items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)
-        student_params.append(param)
+        student_params = torch.cat([v.data.to(device).reshape(-1) for k, v in timestamps.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)
 
 
         # compute parameter distance loss and update distilled dataset
         param_loss = torch.tensor(0.0).to(device)
         param_dist = torch.tensor(0.0).to(device)
 
-        param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
+        param_loss += torch.nn.functional.mse_loss(student_params, target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
         print("iter = %04d, param_loss = %.4f, param_dist = %.4f" % (it, param_loss, param_dist))
         param_loss /= param_dist
@@ -451,14 +445,21 @@ def main(
 
         grand_loss.backward()
 
+        # Print out the gradients
+        for i, text in enumerate(syn_text):
+            print(f"Gradient of syn_text[{i}]:", text.grad)
+        print("Gradient of syn_lr:", syn_lr.grad)
+
         optimizer_text.step()
         optimizer_lr.step()
+
+        wandb.log({"Grand_Loss": grand_loss.detach().cpu()})
         
-        for _ in student_params:
-            del _
         
         if it%10 == 0:
             print('iter = %04d, loss = %.4f' % (it, grand_loss.item()))
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     fire.Fire(main)

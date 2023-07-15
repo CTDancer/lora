@@ -155,7 +155,7 @@ def main(
                 max_new_tokens=max_new_tokens,
             )
         s = generation_output.sequences[0]
-        output = tokenizer.decode(s)
+        output = tokenizer.decode(s[:-1])
         yield prompter.get_response(output)
 
     gr.Interface(
