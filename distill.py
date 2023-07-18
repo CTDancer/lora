@@ -12,6 +12,7 @@ import evaluate
 from torch.utils.data import Dataset, TensorDataset
 import logging
 import wandb
+import torch.nn.functional as F
 
 from peft import (
     LoraConfig,
@@ -87,12 +88,12 @@ def main(
         ]
     )
 
-    wandb.init(sync_tensorboard=False,
-                entity='tongchen',
-                project="alpaca-lora-distill",
-                name="size=100-lr_teacher={}-lr_text={}-lr_lr={}-syn_steps={}".format(lr_teacher, lr_text, lr_lr, syn_steps)
-            #    name='test'
-               )
+    # wandb.init(sync_tensorboard=False,
+    #             entity='tongchen',
+    #             project="alpaca-lora-distill",
+    #             name="size=100-lr_teacher={}-lr_text={}-lr_lr={}-syn_steps={}".format(lr_teacher, lr_text, lr_lr, syn_steps)
+    #         #    name='test'
+    #            )
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -210,6 +211,7 @@ def main(
             args=transformers.TrainingArguments(
                 per_device_train_batch_size=micro_batch_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                train_batch_size=4,
                 warmup_steps=0,
                 num_train_epochs=syn_steps,
                 learning_rate=syn_lr,
@@ -242,19 +244,37 @@ def main(
 
 
     # get the inputs for trainer
-    syn_text = []
     dataloader = syn_trainer.get_train_dataloader()
     keys = []
     for batch in dataloader:
         input = syn_trainer._prepare_inputs(batch)
-        text = [v.float() for k,v in input.items()]
-        text = torch.stack(text, dim=2).requires_grad_(True)
-        syn_text.append(text)
-        if not keys:
-            keys = [k for k in input]
+        keys = [k for k in input]
+        break
 
+    syn_text = [[]] * len(keys)
+    for batch in dataloader:
+        input = syn_trainer._prepare_inputs(batch)
+        i = 0
+        for k, v in input.items():
+            if k == 'input_ids':
+                one_hot_v = F.one_hot(v, num_classes=32000)
+                v = F.gumbel_softmax(one_hot_v.float(), tau=1.0, hard=False, dim=-1)
+                print(v.shape)
+                syn_text[i].append(v)
+            else:
+                syn_text[i].append(v.float())
+
+            i += 1
+    for item in syn_text:
+        dim = item[0].dim()
+        item = torch.stack(item, dim=dim).requires_grad_(True)
+        print("item shape: ", item.shape)
+    
+    print("length: ", len(syn_text))
     # define the optimizers
-    optimizer_text = torch.optim.SGD(syn_text, lr=lr_text, momentum=0.5)
+    optimizer_list = [None] * len(keys)
+    for i in range(len(optimizer_list)):
+        optimizer_list[i] = torch.optim.SGD(syn_text[i], lr=lr_text, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=lr_lr, momentum=0.5)
 
     eval_it_pool = np.arange(0, Iteration + 1, eval_it).tolist()[1:]
@@ -289,7 +309,7 @@ def main(
     best_metric = 0
 
     for it in range(0, Iteration+1):
-        wandb.log({"Progress": it}, step=it)
+        # wandb.log({"Progress": it}, step=it)
         save_this_it = False
 
         expert_trajectory = buffer
@@ -385,7 +405,7 @@ def main(
                 best_metric = metric
                 save_this_it = True
             
-            wandb.log({'BLEU': metric['eval_bleu']}, step=it)
+            # wandb.log({'BLEU': metric['eval_bleu']}, step=it)
 
         if (save_this_it or it % 1000 == 0):
             with torch.no_grad():
@@ -402,7 +422,7 @@ def main(
                     torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
 
 
-        wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
+        # wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
         # define expert and student parameters
         # start_epoch = np.random.randint(0, max_start_epoch)
         # starting_params = expert_trajectory[start_epoch]
@@ -419,11 +439,9 @@ def main(
         #     if name in starting_dict and ('lora_' in name or 'bias' in name):
         #         param.data = starting_dict[name]
 
-        print(f"Is syn_text[{0}] a leaf node?:", syn_text[0].is_leaf)
-
         # use distilled dataset to train the model for syn_steps steps and get parameters along the way
         timestamps = None
-        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys)
+        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys, lr=syn_lr)
 
         # for param_dict in timestamps:
         student_params = torch.cat([v.data.to(device).reshape(-1) for k, v in timestamps.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)
@@ -440,7 +458,8 @@ def main(
 
         grand_loss = param_loss
 
-        optimizer_text.zero_grad()
+        for optimizer in optimizer_list:
+            optimizer.zero_grad()
         optimizer_lr.zero_grad()
 
         grand_loss.backward()
@@ -450,16 +469,17 @@ def main(
             print(f"Gradient of syn_text[{i}]:", text.grad)
         print("Gradient of syn_lr:", syn_lr.grad)
 
-        optimizer_text.step()
+        for optimizer in optimizer_list:
+            optimizer.step()
         optimizer_lr.step()
 
-        wandb.log({"Grand_Loss": grand_loss.detach().cpu()})
+        # wandb.log({"Grand_Loss": grand_loss.detach().cpu()})
         
         
         if it%10 == 0:
             print('iter = %04d, loss = %.4f' % (it, grand_loss.item()))
     
-    wandb.finish()
+    # wandb.finish()
 
 if __name__ == "__main__":
     fire.Fire(main)
