@@ -1,5 +1,18 @@
 # 🦙🌲🤏 Alpaca-LoRA
 
+To distill sft dataset, we finetune LLaMA-7B on Alpaca dataset using LoRA.
+We first need to modify some package files:
+1. ./site-packages/transformers/trainer.py 
+2. ./site-packages/transformers/models/llama/modeling_llama.py
+3. ./site-packages/peft/utils/other.py
+4. ./torch/nn/modules/sparse.py
+
+In trainer.py, I modified `train()`, `_inner_training_loop()`, `compute_loss()`.
+In modeling_llama.py, I modified `forward()` of `LlamaModel`, forward() of `LlamaForCausalLM` and set `supports_gradient_checkpointing = False` of `LlamaPreTrainedModel`.
+In other.py, I removed `model.gradient_checkpointing_enable()` in `prepare_model_for_int8_training()`.
+In sparse.py, I modified `forward()` of `Embedding`.
+
+
 - 🤗 **Try the pretrained model out [here](https://huggingface.co/spaces/tloen/alpaca-lora), courtesy of a GPU grant from Huggingface!**
 - Users have created a Discord server for discussion and support [here](https://discord.gg/prbq284xX5)
 - 4/14: Chansung Park's GPT4-Alpaca adapters: https://github.com/tloen/alpaca-lora/issues/340
