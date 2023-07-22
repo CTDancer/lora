@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, TensorDataset
 import logging
 import wandb
 import torch.nn.functional as F
+from utils.reparam_module import ReparamModule
 
 from peft import (
     LoraConfig,
@@ -79,14 +80,14 @@ def main(
     epoch_eval_train: int = 20
 ): 
     # Configure the root logger
-    logging.basicConfig(
-        level=logging.INFO,  # Set the desired log level
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('logs/distill.log'),  # Save logs to a file
-            logging.StreamHandler()  # Print logs to the console
-        ]
-    )
+    # logging.basicConfig(
+    #     level=logging.INFO,  # Set the desired log level
+    #     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    #     handlers=[
+    #         logging.FileHandler('logs/distill.log'),  # Save logs to a file
+    #         logging.StreamHandler()  # Print logs to the console
+    #     ]
+    # )
 
     # wandb.init(sync_tensorboard=False,
     #             entity='tongchen',
@@ -96,7 +97,7 @@ def main(
     #            )
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+    distributed = torch.cuda.device_count() > 1
 
     # get the model for training
     model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
@@ -202,19 +203,14 @@ def main(
     syn_lr = torch.tensor(lr_teacher).to(device)
     syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-    # get the trainer for synthetic step
-    syn_trainer = transformers.Trainer(
+    temp_trainer = transformers.Trainer(
             model=model,
             train_dataset=train_data,
             eval_dataset=None,
-            compute_metrics=compute_metrics,
             args=transformers.TrainingArguments(
                 per_device_train_batch_size=micro_batch_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
-                train_batch_size=4,
                 warmup_steps=0,
-                num_train_epochs=syn_steps,
-                learning_rate=syn_lr,
                 fp16=True,
                 logging_steps=1,
                 optim="adamw_torch",
@@ -227,57 +223,47 @@ def main(
             ),
             callbacks=[SavePeftModelCallback],
         )
-
-    model.config.use_cache = False
-
-    starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in model.named_parameters() if 'lora_' in k or 'bias' in k], 0)
-
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(
-            self, old_state_dict()
-        )
-    ).__get__(model, type(model))
-
-    if torch.__version__ >= "2" and sys.platform != "win32":
-        model = torch.compile(model)
-
-
     # get the inputs for trainer
-    dataloader = syn_trainer.get_train_dataloader()
+    dataloader = temp_trainer.get_train_dataloader(batch_size=2)
     keys = []
     for batch in dataloader:
-        input = syn_trainer._prepare_inputs(batch)
+        input = temp_trainer._prepare_inputs(batch)
         keys = [k for k in input]
         break
 
-    syn_text = [[]] * len(keys)
+    syn_text = [[] for _ in range(len(keys))]
+    masks = []
     for batch in dataloader:
-        input = syn_trainer._prepare_inputs(batch)
-        i = 0
+        input = temp_trainer._prepare_inputs(batch)
         for k, v in input.items():
             if k == 'input_ids':
                 one_hot_v = F.one_hot(v, num_classes=32000)
-                v = F.gumbel_softmax(one_hot_v.float(), tau=1.0, hard=False, dim=-1)
-                print(v.shape)
-                syn_text[i].append(v)
+                v = F.gumbel_softmax(one_hot_v.float(), tau=1.0, hard=False, dim=-1).requires_grad_(True)
+                syn_text[0].append(v)
+            elif k == 'labels':
+                mask = (v == -100).float()
+                masks.append(mask)
+                v[v == -100] = 0
+                one_hot_v = F.one_hot(v, num_classes=32000)
+                gumbel_v = F.gumbel_softmax(one_hot_v.float(), tau=1.0, hard=False, dim=-1)
+                syn_text[2].append(gumbel_v.requires_grad_(True))
             else:
-                syn_text[i].append(v.float())
+                for i, key in enumerate(keys):
+                    if k == key:
+                        syn_text[i].append(v.float().requires_grad_(True))
+                        break
 
-            i += 1
-    for item in syn_text:
-        dim = item[0].dim()
-        item = torch.stack(item, dim=dim).requires_grad_(True)
-        print("item shape: ", item.shape)
-    
-    print("length: ", len(syn_text))
     # define the optimizers
-    optimizer_list = [None] * len(keys)
+    optimizer_list = [None] * (len(keys))
     for i in range(len(optimizer_list)):
         optimizer_list[i] = torch.optim.SGD(syn_text[i], lr=lr_text, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=lr_lr, momentum=0.5)
 
     eval_it_pool = np.arange(0, Iteration + 1, eval_it).tolist()[1:]
+
+    del temp_trainer
+    del model
+    torch.cuda.empty_cache()
 
     if load_all:
         buffer = []
@@ -312,6 +298,9 @@ def main(
         # wandb.log({"Progress": it}, step=it)
         save_this_it = False
 
+        model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
+                                                            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
+        
         expert_trajectory = buffer
         if load_all:
             expert_trajectory = buffer[np.random.randint(0, len(buffer))]
@@ -332,50 +321,127 @@ def main(
                     buffer = buffer[:max_experts]
                 random.shuffle(buffer)
         
-        # get dataset for evaluation or saving
-        if (it in eval_it_pool) or save_this_it or (it % 1000 == 0):
-            batches = []
-            for i in range(len(syn_text)):
-                batch = {}
-                for j in range(len(keys)):
-                    batch.update({keys[j]: torch.round(syn_text[i][:,:,j]).detach().long()})
-                batches.append(batch)
+        # # get dataset for evaluation or saving
+        # if (it in eval_it_pool) or save_this_it or (it % 1000 == 0):
+        #     batches = []
+        #     for i in range(len(syn_text)):
+        #         batch = {}
+        #         for j in range(len(keys)):
+        #             batch.update({keys[j]: torch.round(syn_text[i][:,:,j]).detach().long()})
+        #         batches.append(batch)
             
-            dataset = CustomDataset(batches)
-            metadata = {
-                'features': ['input_ids', 'attention_mask', 'labels'],
-                'num_rows': len(dataset)
-            }
-            eval_dataset = {'Dataset': dataset, 'metadata': metadata}
+        #     dataset = CustomDataset(batches)
+        #     metadata = {
+        #         'features': ['input_ids', 'attention_mask', 'labels'],
+        #         'num_rows': len(dataset)
+        #     }
+        #     eval_dataset = {'Dataset': dataset, 'metadata': metadata}
 
-        if it in eval_it_pool:
-            lr = syn_lr.item()
+        # if it in eval_it_pool:
+        #     lr = syn_lr.item()
 
-            # get model for evaluation
-            eval_model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
-                                                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
+        #     # get model for evaluation
+        #     eval_model, gradient_accumulation_steps, ddp = get_model(base_model=base_model, batch_size=batch_size, micro_batch_size=micro_batch_size,
+        #                                                 lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, lora_target_modules=lora_target_modules)
 
-            eval_trainer = transformers.Trainer(
-                model=eval_model,
-                train_dataset=eval_dataset,
-                eval_dataset=val_data,
-                compute_metrics=compute_metrics,
+        #     eval_trainer = transformers.Trainer(
+        #         model=eval_model,
+        #         train_dataset=eval_dataset,
+        #         eval_dataset=val_data,
+        #         compute_metrics=compute_metrics,
+        #         args=transformers.TrainingArguments(
+        #             per_device_train_batch_size=micro_batch_size,
+        #             gradient_accumulation_steps=gradient_accumulation_steps,
+        #             warmup_steps=100,
+        #             num_train_epochs=epoch_eval_train,
+        #             learning_rate=float(lr),
+        #             fp16=True,
+        #             logging_steps=10,
+        #             optim="adamw_torch",
+        #             evaluation_strategy="steps" if val_set_size > 0 else "no",
+        #             save_strategy="steps",
+        #             eval_steps=200 if val_set_size > 0 else None,
+        #             save_steps=200,
+        #             output_dir=output_dir,
+        #             save_total_limit=3,
+        #             load_best_model_at_end=True if val_set_size > 0 else False,
+        #             ddp_find_unused_parameters=False if ddp else None,
+        #             group_by_length=group_by_length,
+        #         ),
+        #         data_collator=transformers.DataCollatorForSeq2Seq(
+        #             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        #         ),
+        #         callbacks=[SavePeftModelCallback],
+        #     )
+        #     eval_model.config.use_cache = False
+
+        #     old_state_dict = eval_model.state_dict
+        #     eval_model.state_dict = (
+        #         lambda self, *_, **__: get_peft_model_state_dict(
+        #             self, old_state_dict()
+        #         )
+        #     ).__get__(eval_model, type(eval_model))
+
+        #     if torch.__version__ >= "2" and sys.platform != "win32":
+        #         eval_model = torch.compile(eval_model)
+
+        #     eval_trainer.train()
+        #     metric = eval_trainer.evaluate()
+
+        #     print("metric: ", metric)
+
+        #     if (metric['eval_bleu'] > best_metric):
+        #         best_metric = metric
+        #         save_this_it = True
+            
+        #     # wandb.log({'BLEU': metric['eval_bleu']}, step=it)
+
+        # if (save_this_it or it % 1000 == 0):
+        #     with torch.no_grad():
+        #         text_save = eval_dataset
+        #         save_dir = os.path.join(".", "logged_files")
+
+        #         if not os.path.exists(save_dir):
+        #             os.makedirs(save_dir)
+
+        #         torch.save(text_save, os.path.join(save_dir, "text_{}.json".format(it)))
+
+        #         if save_this_it:
+        #             torch.save(text_save, os.path.join(save_dir, "text_best.json"))
+        #             torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
+
+
+        # wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
+        
+        target_params = expert_trajectory[-1]
+        target_params = torch.cat([v.data.to(device).reshape(-1) for k, v in target_params.items() if 'lora_' in k or 'bias' in k], 0)
+
+        # starting_params = torch.cat([v.data.to(device).reshape(-1) for k, v in model.named_parameters() if 'lora_' in k or 'bias' in k], 0)
+        student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in model.named_parameters() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)]
+
+        model = ReparamModule(model)
+
+        if distributed:
+            model = torch.nn.DataParallel(model)
+
+        model.zero_grad()
+
+        for epoch in range(0, syn_steps):
+
+            syn_trainer = transformers.Trainer(
+                model=model,
+                train_dataset=train_data,
+                eval_dataset=None,
                 args=transformers.TrainingArguments(
                     per_device_train_batch_size=micro_batch_size,
                     gradient_accumulation_steps=gradient_accumulation_steps,
-                    warmup_steps=100,
-                    num_train_epochs=epoch_eval_train,
-                    learning_rate=float(lr),
+                    warmup_steps=0,
+                    num_train_epochs=syn_steps,
+                    learning_rate=syn_lr,
                     fp16=True,
-                    logging_steps=10,
+                    logging_steps=1,
                     optim="adamw_torch",
-                    evaluation_strategy="steps" if val_set_size > 0 else "no",
-                    save_strategy="steps",
-                    eval_steps=200 if val_set_size > 0 else None,
-                    save_steps=200,
                     output_dir=output_dir,
-                    save_total_limit=3,
-                    load_best_model_at_end=True if val_set_size > 0 else False,
                     ddp_find_unused_parameters=False if ddp else None,
                     group_by_length=group_by_length,
                 ),
@@ -384,75 +450,51 @@ def main(
                 ),
                 callbacks=[SavePeftModelCallback],
             )
-            eval_model.config.use_cache = False
-
-            old_state_dict = eval_model.state_dict
-            eval_model.state_dict = (
-                lambda self, *_, **__: get_peft_model_state_dict(
-                    self, old_state_dict()
-                )
-            ).__get__(eval_model, type(eval_model))
 
             if torch.__version__ >= "2" and sys.platform != "win32":
-                eval_model = torch.compile(eval_model)
+                model = torch.compile(model)
 
-            eval_trainer.train()
-            metric = eval_trainer.evaluate()
+            index = random.randint(0, len(syn_text[0])-1)
+            input_dict = {}
+            for i in range(len(keys)):
+                input_dict[keys[i]] = syn_text[i][index]
 
-            print("metric: ", metric)
+            model.train()
 
-            if (metric['eval_bleu'] > best_metric):
-                best_metric = metric
-                save_this_it = True
-            
-            # wandb.log({'BLEU': metric['eval_bleu']}, step=it)
+            prepared_inputs = syn_trainer._prepare_inputs(input_dict)
 
-        if (save_this_it or it % 1000 == 0):
-            with torch.no_grad():
-                text_save = eval_dataset
-                save_dir = os.path.join(".", "logged_files")
+            if distributed:
+                forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
+            else:
+                forward_params = student_params[-1]
 
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
+            with syn_trainer.compute_loss_context_manager():
+                loss = syn_trainer.compute_loss(model, prepared_inputs, flat_param=forward_params)
+                mask = masks[index]
+                loss = (loss * (1 - mask)).sum() / (1 - mask).sum()
+                print("loss: ", loss)
 
-                torch.save(text_save, os.path.join(save_dir, "text_{}.json".format(it)))
+            grad = torch.autograd.grad(loss, student_params[-1], create_graph=True)[0]
 
-                if save_this_it:
-                    torch.save(text_save, os.path.join(save_dir, "text_best.json"))
-                    torch.save(syn_lr.item(), os.path.join(save_dir, "lr_best.pt"))
+            tmp = student_params[-1] - syn_lr * grad
+            student_params.append(tmp)
 
-
-        # wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
-        # define expert and student parameters
-        # start_epoch = np.random.randint(0, max_start_epoch)
-        # starting_params = expert_trajectory[start_epoch]
-
-        # starting_dict = starting_params
-
-        target_params = expert_trajectory[-1]
-        target_params = torch.cat([v.data.to(device).reshape(-1) for k, v in target_params.items() if 'lora_' in k or 'bias' in k], 0)
-
-        # student_params = [torch.cat([v.data.to(device).reshape(-1) for k, v in starting_params.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)]
-
-        # initialize model's weights with expert parameters
-        # for name, param in model.named_parameters():
-        #     if name in starting_dict and ('lora_' in name or 'bias' in name):
-        #         param.data = starting_dict[name]
 
         # use distilled dataset to train the model for syn_steps steps and get parameters along the way
-        timestamps = None
-        timestamps = syn_trainer.syn_train(inputs=syn_text, keys=keys, lr=syn_lr)
-
-        # for param_dict in timestamps:
-        student_params = torch.cat([v.data.to(device).reshape(-1) for k, v in timestamps.items() if 'lora_' in k or 'bias' in k], 0).requires_grad_(True)
-
+        # student_params = None
+        # student_params = syn_trainer.syn_train(inputs=syn_text, keys=keys, masks=masks, lr=syn_lr, student_params=student_params)
 
         # compute parameter distance loss and update distilled dataset
         param_loss = torch.tensor(0.0).to(device)
         param_dist = torch.tensor(0.0).to(device)
 
-        param_loss += torch.nn.functional.mse_loss(student_params, target_params, reduction="sum")
-        param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
+        # for k, v in target_params.items():
+        #     if 'lora_' in k or 'bias' in k:
+        #         param_loss += torch.dist(student_params[k], target_params[k])
+        #         param_dist += torch.dist(starting_params[k], target_params[k])
+
+        param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
+        param_dist += torch.nn.functional.mse_loss(student_params[0], target_params, reduction="sum")
         print("iter = %04d, param_loss = %.4f, param_dist = %.4f" % (it, param_loss, param_dist))
         param_loss /= param_dist
 
@@ -465,8 +507,11 @@ def main(
         grand_loss.backward()
 
         # Print out the gradients
-        for i, text in enumerate(syn_text):
-            print(f"Gradient of syn_text[{i}]:", text.grad)
+        for i in range(len(syn_text)):
+            print("The gradients of {}:".format(keys[i]))
+            for j in range(len(syn_text[i])):
+                print(syn_text[i][j].grad)
+
         print("Gradient of syn_lr:", syn_lr.grad)
 
         for optimizer in optimizer_list:
@@ -474,11 +519,17 @@ def main(
         optimizer_lr.step()
 
         # wandb.log({"Grand_Loss": grand_loss.detach().cpu()})
-        
-        
+
+        for _ in student_params:
+            del _
+
+        del syn_trainer
+        del model
+        torch.cuda.empty_cache()
+
         if it%10 == 0:
             print('iter = %04d, loss = %.4f' % (it, grand_loss.item()))
-    
+
     # wandb.finish()
 
 if __name__ == "__main__":
