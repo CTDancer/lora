@@ -1976,8 +1976,6 @@ class Trainer:
                 else:
                     tr_loss_step = self.training_step(model, inputs)
 
-                print("loss : ", tr_loss_step)
-
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_tpu_available()
@@ -1987,9 +1985,6 @@ class Trainer:
                     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
                     tr_loss += tr_loss_step
-                
-                import pdb
-                pdb.set_trace()
 
                 self.current_flos += float(self.floating_point_ops(inputs))
 
@@ -2169,10 +2164,6 @@ class Trainer:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
 
-        params = [param for name, param in model.named_parameters() if 'lora_' in name or 'bias' in name]
-        grad = torch.autograd.grad(loss, params, create_graph=True)
-        print("grad is ", grad)
-
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -2183,10 +2174,6 @@ class Trainer:
             loss = self.deepspeed.backward(loss)
         else:
             loss.backward()
-
-        # for name, param in model.named_parameters():
-        #     if param.grad is not None:
-        #         print(f"Parameter: {name}, Requires Gradient: {param.requires_grad}, Gradient Value: {param.grad}")
 
         return loss.detach()
 
