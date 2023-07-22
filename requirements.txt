@@ -12,3 +12,4 @@ sentencepiece
 gradio
 sacrebleu
 evaluate
+scipy
