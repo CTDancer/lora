@@ -8,8 +8,11 @@ We first need to modify some package files:
 4. ./torch/nn/modules/sparse.py
 
 In trainer.py, I modified `train()`, `_inner_training_loop()`, `compute_loss()`.
+
 In modeling_llama.py, I modified `forward()` of `LlamaModel`, forward() of `LlamaForCausalLM` and set `supports_gradient_checkpointing = False` of `LlamaPreTrainedModel`.
+
 In other.py, I removed `model.gradient_checkpointing_enable()` in `prepare_model_for_int8_training()`.
+
 In sparse.py, I modified `forward()` of `Embedding`.
 
 
